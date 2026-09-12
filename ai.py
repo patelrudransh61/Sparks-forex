@@ -2,13 +2,21 @@ import os
 import json
 import logging
 import asyncio
+import re
 
 from google import genai
 
 log = logging.getLogger("market-bot")
 
+# =========================================================
+# GEMINI CONFIG
+# =========================================================
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash"
+)
 
 if not GEMINI_API_KEY:
     log.warning("GEMINI_API_KEY is not configured.")
@@ -18,6 +26,10 @@ client = genai.Client(
 )
 
 
+# =========================================================
+# HELPERS
+# =========================================================
+
 def _snapshot_to_dict(snapshot):
     return {
         "price": getattr(snapshot, "price", None),
@@ -25,7 +37,11 @@ def _snapshot_to_dict(snapshot):
         "sma20": getattr(snapshot, "sma20", None),
         "sma50": getattr(snapshot, "sma50", None),
         "rsi14": getattr(snapshot, "rsi14", None),
-        "volatility_pct": getattr(snapshot, "volatility_pct", None),
+        "volatility_pct": getattr(
+            snapshot,
+            "volatility_pct",
+            None
+        ),
     }
 
 
@@ -36,6 +52,7 @@ def _news_to_text(news):
     lines = []
 
     for item in news[:10]:
+
         if isinstance(item, str):
             lines.append(f"- {item}")
 
@@ -44,6 +61,7 @@ def _news_to_text(news):
                 item.get("title")
                 or item.get("headline")
                 or item.get("name")
+                or item.get("summary")
                 or str(item)
             )
 
@@ -58,9 +76,78 @@ def _news_to_text(news):
 def _safe_float(value, default=0.0):
     try:
         return float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
+
+def _clean_json_response(text):
+    """
+    Gemini kabhi-kabhi JSON ko markdown code block
+    ke andar return kar deta hai.
+    """
+
+    if not text:
+        return ""
+
+    text = text.strip()
+
+    # ```json ... ```
+    text = re.sub(
+        r"^```json\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # ``` ... ```
+    text = re.sub(
+        r"^```\s*",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text
+    )
+
+    text = text.strip()
+
+    # Agar extra text ke saath JSON aaya ho,
+    # first { aur last } ke beech ka part try karo.
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}")
+
+        if start != -1 and end != -1:
+            text = text[start:end + 1]
+
+    return text.strip()
+
+
+def _clean_summary(text):
+    """
+    Telegram HTML parse mode ke saath conflict na ho.
+    """
+
+    if not text:
+        return "No additional analysis available."
+
+    text = str(text)
+
+    text = (
+        text.replace("&", "and")
+        .replace("<", "")
+        .replace(">", "")
+    )
+
+    return text[:1000]
+
+
+# =========================================================
+# MAIN AI ANALYSIS
+# =========================================================
 
 async def analyze(snapshot, news, session):
 
@@ -81,6 +168,8 @@ async def analyze(snapshot, news, session):
         "UNKNOWN"
     )
 
+    # Maximum money exposed according to user's
+    # selected risk percentage.
     risk_amount = budget * risk_pct / 100
 
     active_trade = getattr(
@@ -89,43 +178,72 @@ async def analyze(snapshot, news, session):
         None
     )
 
+    # =====================================================
+    # ACTIVE TRADE
+    # =====================================================
+
     if active_trade:
 
         trade_info = f"""
-ACTIVE TRADE:
+ACTIVE TRADE IS CURRENTLY OPEN.
 
-Direction: {getattr(active_trade, "direction", "UNKNOWN")}
-Entry: {getattr(active_trade, "entry", "UNKNOWN")}
-Stop Loss: {getattr(active_trade, "stop_loss", "UNKNOWN")}
-Target: {getattr(active_trade, "target", "UNKNOWN")}
+Direction:
+{getattr(active_trade, "direction", "UNKNOWN")}
 
-The active trade has priority.
-Focus on whether the trade should be:
-HOLD, WATCH or EXIT-WATCH.
+Entry:
+{getattr(active_trade, "entry", "UNKNOWN")}
+
+Stop Loss:
+{getattr(active_trade, "stop_loss", "UNKNOWN")}
+
+Target:
+{getattr(active_trade, "target", "UNKNOWN")}
+
+IMPORTANT:
+The existing trade has priority over finding a new signal.
+
+Analyze whether the current trade should:
+- HOLD
+- WATCH
+- EXIT-WATCH
+
+Do not suggest opening another trade while this
+trade is being monitored.
 """
 
     else:
 
         trade_info = """
-No active trade.
+NO ACTIVE TRADE.
 
-Focus on discovering a new potential setup.
+Look for a new high-quality setup.
+
+If the available evidence is insufficient,
+return WAIT.
 """
 
-    prompt = f"""
-You are SPARKS FOREX, an AI-assisted financial
-market analysis engine.
+    # =====================================================
+    # GEMINI PROMPT
+    # =====================================================
 
-You analyze market data and available news/reports.
+    prompt = f"""
+You are SPARKS FOREX, an AI-assisted market
+analysis engine.
+
+Your job is to analyze the supplied market data
+and available news/reports.
 
 You DO NOT execute trades.
 You DO NOT connect to MT5.
+You DO NOT place orders.
 You DO NOT guarantee profits.
-You must clearly communicate uncertainty.
 
-========================
+Only analyze the information actually supplied.
+Never invent prices, news, indicators or market data.
+
+==================================================
 SESSION
-========================
+==================================================
 
 Asset:
 {asset}
@@ -139,9 +257,9 @@ Maximum Risk:
 Maximum Risk Amount:
 {risk_amount:.2f} INR
 
-========================
+==================================================
 MARKET DATA
-========================
+==================================================
 
 Current Price:
 {market["price"]}
@@ -161,50 +279,50 @@ RSI14:
 Volatility:
 {market["volatility_pct"]}%
 
-========================
+==================================================
 NEWS / REPORTS
-========================
+==================================================
 
 {news_text}
 
-========================
+==================================================
 TRADE STATUS
-========================
+==================================================
 
 {trade_info}
 
-========================
-TASK
-========================
+==================================================
+ANALYSIS
+==================================================
 
-Analyze the available information.
+Evaluate:
 
-Consider:
-
-1. Market trend
+1. Overall market trend
 2. Momentum
-3. RSI
-4. SMA20 vs SMA50
+3. SMA20 vs SMA50
+4. RSI
 5. Volatility
-6. News/report sentiment
+6. News/report impact
 7. Potential support/resistance
 8. Risk/reward
-9. Existing trade if present
+9. Signal quality
+10. Existing trade conditions, if applicable
 
-A BUY or SELL should only be returned when
-there is a reasonably supported setup.
+Only produce BUY or SELL when the available
+evidence supports a reasonably strong setup.
 
-Otherwise return WAIT.
+Otherwise use WAIT.
 
-Do NOT invent market data.
-
-========================
-RESPONSE FORMAT
-========================
+==================================================
+RESPONSE
+==================================================
 
 Return ONLY valid JSON.
 
-Use exactly this structure:
+Do not use Markdown.
+Do not add explanations outside the JSON.
+
+Use exactly:
 
 {{
   "action": "BUY",
@@ -214,46 +332,66 @@ Use exactly this structure:
   "stop_loss_reference": 0,
   "target_reference": 0,
   "suggested_amount": 0,
-  "trade_management": "HOLD",
+  "trade_management": "WATCH",
   "summary": "Short explanation."
 }}
 
-Rules:
+==================================================
+RULES
+==================================================
 
 action:
 BUY, SELL or WAIT
 
 confidence:
-0 to 100
+Integer from 0 to 100.
 
 risk_level:
-LOW, MEDIUM or HIGH
+LOW, MEDIUM or HIGH.
 
 entry_reference:
-Use 0 when no valid setup.
+Use the supplied market information.
+Use 0 if there is no reliable setup.
 
 stop_loss_reference:
-Use 0 when no valid setup.
+Use 0 if no reliable setup.
 
 target_reference:
-Use 0 when no valid setup.
+Use 0 if no reliable setup.
 
 suggested_amount:
-Never exceed the session budget.
-Keep the amount consistent with the stated risk.
+Must NEVER exceed:
+{risk_amount:.2f} INR
+
+If there is no valid BUY or SELL setup,
+use 0.
 
 trade_management:
-For no active trade:
+
+If there is NO active trade:
 NO-TRADE or WATCH
 
-For active trade:
+If there IS an active trade:
 HOLD, WATCH or EXIT-WATCH
 
 summary:
-Keep it concise and explain the reasoning.
+Short, factual explanation of why the AI reached
+the decision.
+
+Do not claim certainty.
 """
 
+
+    # =====================================================
+    # GEMINI REQUEST
+    # =====================================================
+
     try:
+
+        if not GEMINI_API_KEY:
+            raise RuntimeError(
+                "GEMINI_API_KEY is missing."
+            )
 
         response = await asyncio.to_thread(
             client.models.generate_content,
@@ -261,82 +399,195 @@ Keep it concise and explain the reasoning.
             contents=prompt,
         )
 
-        if not response:
+        if response is None:
             raise RuntimeError(
-                "Gemini returned no response."
+                "Gemini returned an empty response."
             )
 
-        raw = response.text or ""
+        raw = getattr(
+            response,
+            "text",
+            ""
+        )
 
-        raw = raw.strip()
+        raw = _clean_json_response(raw)
 
-        # Remove markdown JSON fences if Gemini adds them
-        if raw.startswith("```"):
-            raw = raw.replace("```json", "")
-            raw = raw.replace("```", "")
-            raw = raw.strip()
+        if not raw:
+            raise RuntimeError(
+                "Gemini returned an empty response."
+            )
 
-        result = json.loads(raw)
+        log.info(
+            "Gemini response received for %s",
+            asset
+        )
+
+        # =================================================
+        # PARSE JSON
+        # =================================================
+
+        try:
+
+            result = json.loads(raw)
+
+        except json.JSONDecodeError:
+
+            log.error(
+                "Invalid Gemini JSON: %s",
+                raw
+            )
+
+            raise RuntimeError(
+                "Gemini returned invalid JSON."
+            )
+
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "Gemini response is not a JSON object."
+            )
+
+        # =================================================
+        # ACTION
+        # =================================================
 
         action = str(
-            result.get("action", "WAIT")
-        ).upper()
+            result.get(
+                "action",
+                "WAIT"
+            )
+        ).upper().strip()
 
-        if action not in ("BUY", "SELL", "WAIT"):
+        if action not in (
+            "BUY",
+            "SELL",
+            "WAIT"
+        ):
             action = "WAIT"
 
         result["action"] = action
 
-        result["confidence"] = max(
-            0,
-            min(
-                100,
-                _safe_float(
-                    result.get("confidence", 0)
-                )
+        # =================================================
+        # CONFIDENCE
+        # =================================================
+
+        confidence = _safe_float(
+            result.get(
+                "confidence",
+                0
             )
         )
 
-        result["risk_level"] = str(
+        confidence = max(
+            0,
+            min(
+                100,
+                confidence
+            )
+        )
+
+        result["confidence"] = confidence
+
+        # =================================================
+        # RISK LEVEL
+        # =================================================
+
+        risk_level = str(
             result.get(
                 "risk_level",
                 "UNKNOWN"
             )
-        ).upper()
+        ).upper().strip()
+
+        if risk_level not in (
+            "LOW",
+            "MEDIUM",
+            "HIGH"
+        ):
+            risk_level = "UNKNOWN"
+
+        result["risk_level"] = risk_level
+
+        # =================================================
+        # PRICE REFERENCES
+        # =================================================
 
         result["entry_reference"] = _safe_float(
-            result.get("entry_reference", 0)
-        )
-
-        result["stop_loss_reference"] = _safe_float(
-            result.get("stop_loss_reference", 0)
-        )
-
-        result["target_reference"] = _safe_float(
-            result.get("target_reference", 0)
-        )
-
-        result["suggested_amount"] = max(
-            0,
-            min(
-                budget,
-                _safe_float(
-                    result.get(
-                        "suggested_amount",
-                        risk_amount
-                    )
-                )
+            result.get(
+                "entry_reference",
+                0
             )
         )
 
-        result["trade_management"] = str(
+        result["stop_loss_reference"] = _safe_float(
+            result.get(
+                "stop_loss_reference",
+                0
+            )
+        )
+
+        result["target_reference"] = _safe_float(
+            result.get(
+                "target_reference",
+                0
+            )
+        )
+
+        # =================================================
+        # SUGGESTED AMOUNT
+        # =================================================
+
+        suggested_amount = _safe_float(
+            result.get(
+                "suggested_amount",
+                0
+            )
+        )
+
+        # Never allow AI to exceed user's risk amount.
+        suggested_amount = max(
+            0,
+            min(
+                risk_amount,
+                suggested_amount
+            )
+        )
+
+        # WAIT means no suggested trade amount.
+        if action == "WAIT":
+            suggested_amount = 0
+
+        result["suggested_amount"] = suggested_amount
+
+        # =================================================
+        # TRADE MANAGEMENT
+        # =================================================
+
+        trade_management = str(
             result.get(
                 "trade_management",
                 "WATCH"
             )
+        ).upper().strip()
+
+        allowed_management = (
+            "NO-TRADE",
+            "WATCH",
+            "HOLD",
+            "EXIT-WATCH"
         )
 
-        result["summary"] = str(
+        if trade_management not in allowed_management:
+            trade_management = "WATCH"
+
+        result["trade_management"] = (
+            trade_management
+        )
+
+        # =================================================
+        # SUMMARY
+        # =================================================
+
+        result["summary"] = _clean_summary(
             result.get(
                 "summary",
                 "No additional analysis available."
@@ -345,26 +596,29 @@ Keep it concise and explain the reasoning.
 
         return result
 
-    except json.JSONDecodeError as e:
+    # =====================================================
+    # JSON ERROR
+    # =====================================================
 
-        log.error(
-            "Gemini returned invalid JSON: %s",
-            e
-        )
+    except json.JSONDecodeError:
 
-        log.error(
-            "Gemini raw response: %s",
-            raw if "raw" in locals() else "EMPTY"
+        log.exception(
+            "Gemini JSON parsing failed."
         )
 
         raise RuntimeError(
-            "Gemini returned an invalid analysis format."
+            "Gemini returned invalid JSON."
         )
+
+    # =====================================================
+    # GENERAL ERROR
+    # =====================================================
 
     except Exception as e:
 
         log.exception(
-            "Gemini analysis failed: %s",
+            "Gemini analysis failed for %s: %s",
+            asset,
             e
         )
 
