@@ -7,13 +7,23 @@ from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from .assets import ASSETS
-from .config import TELEGRAM_BOT_TOKEN, BOT_PASSWORD_HASH, UPDATE_INTERVAL_SECONDS, AI_COOLDOWN_SECONDS
-from .data import get_snapshot
-from .news import get_news
-from .ai import analyze
-from .state import AUTHENTICATED, SESSIONS, Session, Trade
-from .ui import main_menu, asset_menu, trade_signal_menu, trade_monitor_menu
+from assets import ASSETS
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    BOT_PASSWORD_HASH,
+    UPDATE_INTERVAL_SECONDS,
+    AI_COOLDOWN_SECONDS,
+)
+from data import get_snapshot
+from news import get_news
+from ai import analyze
+from state import AUTHENTICATED, SESSIONS, Session, Trade
+from ui import (
+    main_menu,
+    asset_menu,
+    trade_signal_menu,
+    trade_monitor_menu,
+)
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("market-bot")
